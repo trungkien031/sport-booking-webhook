@@ -16,7 +16,6 @@ app.get("/", (req, res) => {
 });
 
 // ─── SePay Webhook ────────────────────────────────────────────────────────────
-// SePay POST về đây mỗi khi có giao dịch vào tài khoản ngân hàng của vendor
 app.post("/webhook/sepay", async (req, res) => {
   try {
     // 1. Xác thực token
@@ -44,7 +43,7 @@ app.post("/webhook/sepay", async (req, res) => {
       return res.status(200).json({ success: true, message: "No booking code" });
     }
 
-    const shortCode = match[1]; // VD: "AB12CD34"
+    const shortCode = match[1];
     console.log("Found booking code:", shortCode);
 
     // 4. Tìm các booking chờ thanh toán có bookingId khớp shortCode
@@ -63,7 +62,7 @@ app.post("/webhook/sepay", async (req, res) => {
       return res.status(200).json({ success: true, message: "Booking not found" });
     }
 
-    // 5. Tính tổng deposit cần cọc, so với số tiền nhận được
+    // 5. Tính tổng deposit, so với số tiền nhận được
     const firstData = matchedDocs[0].data();
     const userId = firstData.userId ?? "";
     const vendorId = firstData.vendorId ?? "";
@@ -75,7 +74,7 @@ app.post("/webhook/sepay", async (req, res) => {
       0
     );
 
-    // Cho phép lệch ±5% (làm tròn, phí chuyển khoản...)
+    // Cho phép lệch ±5%
     const amountMatches =
       Math.abs(payload.transferAmount - totalDeposit) <= totalDeposit * 0.05;
 
@@ -98,7 +97,36 @@ app.post("/webhook/sepay", async (req, res) => {
     }
     await batch.commit();
 
-    // 7. Gửi in-app notification
+    // 7. Nếu confirm thành công → xóa slot_locks tương ứng
+    if (amountMatches) {
+      try {
+        const slotLockBatch = db.batch();
+        for (const doc of matchedDocs) {
+          const data = doc.data();
+          const dateKey = data.dateKey ?? "";
+          const courtId = data.courtId ?? "";
+          const timeSlot = data.timeSlot ?? {};
+          const hour =
+            timeSlot.start
+              ? parseInt(timeSlot.start.split(":")[0], 10)
+              : null;
+
+          if (courtId && dateKey && hour !== null && !isNaN(hour)) {
+            const lockId = `${courtId}_${dateKey}_${hour}`;
+            const lockRef = db.collection("slot_locks").doc(lockId);
+            slotLockBatch.delete(lockRef);
+            console.log("Deleting slot_lock:", lockId);
+          }
+        }
+        await slotLockBatch.commit();
+        console.log("slot_locks deleted for confirmed bookings");
+      } catch (lockErr) {
+        // Không block response nếu xóa lock lỗi
+        console.error("Error deleting slot_locks:", lockErr);
+      }
+    }
+
+    // 8. Gửi in-app notification
     const timeSlot = firstData.timeSlot ?? {};
     const timeStr = timeSlot.start
       ? `${timeSlot.start}–${timeSlot.end}`
@@ -106,12 +134,13 @@ app.post("/webhook/sepay", async (req, res) => {
 
     if (amountMatches) {
       // Notify user: tự động xác nhận
+      // FIX: type dùng snake_case để khớp với NotifType trong Flutter
       await pushNotification({
         db,
         userId,
         title: "Đặt sân thành công! 🎉",
         body: `${facilityName} – ${courtName} (${timeStr}) đã được xác nhận tự động. Hẹn gặp bạn trên sân!`,
-        type: "bookingConfirmed",
+        type: "booking_confirmed",
         bookingId: matchedDocs[0].id,
       });
 
@@ -121,17 +150,17 @@ app.post("/webhook/sepay", async (req, res) => {
         userId: vendorId,
         title: "Nhận được tiền cọc 💰",
         body: `${facilityName} – ${courtName} (${timeStr}) vừa nhận ${fmtVND(payload.transferAmount)} tiền cọc. Đặt sân đã tự động xác nhận.`,
-        type: "paymentReceived",
+        type: "payment_received",
         bookingId: matchedDocs[0].id,
       });
     } else {
-      // Số tiền không khớp → cảnh báo vendor kiểm tra
+      // Số tiền không khớp → cảnh báo vendor kiểm tra thủ công
       await pushNotification({
         db,
         userId: vendorId,
         title: "Khách vừa chuyển khoản ⚠️",
         body: `Nhận ${fmtVND(payload.transferAmount)} (cần ${fmtVND(totalDeposit)}). Số tiền chưa khớp — vui lòng kiểm tra thủ công.`,
-        type: "paymentReceived",
+        type: "payment_received",
         bookingId: matchedDocs[0].id,
       });
     }
@@ -147,7 +176,8 @@ app.post("/webhook/sepay", async (req, res) => {
     });
   } catch (err) {
     console.error("Webhook error:", err);
-    return res.status(500).json({ success: false, message: String(err) });
+    // Luôn trả 200 để SePay không retry loop
+    return res.status(200).json({ success: false, message: String(err) });
   }
 });
 
@@ -156,13 +186,15 @@ app.post("/webhook/sepay", async (req, res) => {
 async function pushNotification({ db, userId, title, body, type, bookingId }) {
   if (!userId) return;
   const ref = db.collection("notifications").doc();
+  // FIX: bỏ field `id` vì Flutter đọc documentId trực tiếp qua fromMap(documentId: doc.id)
   await ref.set({
-    id: ref.id,
+    notifId: ref.id,
     userId,
     title,
     body,
     type,
     bookingId: bookingId ?? null,
+    matchId: null,
     isRead: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
