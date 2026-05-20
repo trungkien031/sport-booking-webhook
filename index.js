@@ -166,7 +166,7 @@ app.post("/webhook/sepay", async (req, res) => {
   }
 });
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 async function pushNotification({ db, userId, title, body, type, bookingId }) {
   if (!userId) return;
   const ref = db.collection("notifications").doc();
@@ -186,8 +186,79 @@ function fmtVND(amount) {
   return new Intl.NumberFormat("vi-VN").format(Math.round(amount)) + "đ";
 }
 
+// ─── Auto Cleanup Expired Locks ───────────────────────────────────────────────
+// Chạy mỗi 60 giây ngay trong process này — không cần Cloud Function.
+// Tìm tất cả slot_locks đã hết hạn → xóa lock + expire booking tương ứng
+// → slot tự mở lại cho người dùng khác, không cần client làm gì thêm.
+
+async function cleanupExpiredLocks() {
+  try {
+    const now = admin.firestore.Timestamp.now();
+
+    // Lấy tất cả lock đã quá hạn và chưa bị xóa
+    const expiredSnap = await db
+      .collection("slot_locks")
+      .where("expiresAt", "<=", now)
+      .where("status", "==", "locked")
+      .get();
+
+    if (expiredSnap.empty) return;
+
+    console.log(`🧹 Cleanup: found ${expiredSnap.size} expired lock(s)`);
+
+    for (const lockDoc of expiredSnap.docs) {
+      const lockData = lockDoc.data();
+      const bookingId = lockData.bookingId;
+
+      try {
+        const batch = db.batch();
+
+        // 1. Xóa lock → slot mở ngay lập tức trên BookingScreen realtime
+        batch.delete(lockDoc.ref);
+
+        // 2. Expire booking nếu vẫn chưa thanh toán
+        if (bookingId) {
+          const bookingRef = db.collection("bookings").doc(bookingId);
+          const bookingSnap = await bookingRef.get();
+
+          if (bookingSnap.exists) {
+            const bookingData = bookingSnap.data();
+            const payStatus = bookingData.paymentStatus;
+
+            // Chỉ expire nếu booking chưa được confirm hoặc đang chờ
+            if (payStatus === "unpaid" || payStatus === "awaiting_confirmation") {
+              batch.update(bookingRef, {
+                status: "expired",
+                paymentStatus: "expired",
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+
+              console.log(`  ↳ Expired booking ${bookingId} (was: ${payStatus})`);
+            }
+          }
+        }
+
+        await batch.commit();
+        console.log(`  ↳ Deleted lock ${lockDoc.id}`);
+
+      } catch (err) {
+        console.error(`  ↳ Failed to cleanup lock ${lockDoc.id}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error("🚨 cleanupExpiredLocks error:", err.message);
+  }
+}
+
+// Chạy ngay khi server khởi động (dọn lock còn sót từ lần trước)
+cleanupExpiredLocks();
+
+// Sau đó chạy mỗi 60 giây liên tục
+setInterval(cleanupExpiredLocks, 60 * 1000);
+
 // ─── Start Server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 SePay Webhook Server running on port ${PORT}`);
+  console.log(`🧹 Auto-cleanup expired locks every 60s`);
 });
