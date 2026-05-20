@@ -52,10 +52,12 @@ app.post("/webhook/sepay", async (req, res) => {
       .where("paymentStatus", "in", ["unpaid", "awaiting_confirmation"])
       .get();
 
-    const matchedDocs = bookingsSnap.docs.filter((doc) => {
-      const cleanId = doc.id.replace(/-/g, "").toUpperCase();
-      return cleanId.startsWith(shortCode);
-    });
+   const paymentRef = `SPORTZ-${shortCode}`;
+
+const matchedDocs = bookingsSnap.docs.filter((doc) => {
+  const data = doc.data();
+  return data.paymentReference === paymentRef;
+});
 
     if (matchedDocs.length === 0) {
       console.warn("No booking matched shortCode:", shortCode);
