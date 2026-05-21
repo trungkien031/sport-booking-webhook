@@ -42,9 +42,11 @@ app.post("/webhook/sepay", async (req, res) => {
       return res.status(200).json({ success: true, message: "Skipped outbound" });
     }
 
-    // 2. Trích xuất mã SPORTZ-XXXXXXXX
-    const content = (payload.content ?? "").toUpperCase();
-    const match = content.match(/SPORTZ-([A-Z0-9]{8})/);
+    // 2. Trích xuất mã SPORTZ-XXXXXXXX hoặc SPORTZXXXXXXXX
+    // Một số ngân hàng (MBBank/Momo) tự bỏ dấu gạch ngang khi chuyển tiếp
+    // nên cần match cả 2 dạng: SPORTZ-ABCD1234 và SPORTZABCD1234
+    const content = (payload.content ?? "").toUpperCase().replace(/\s+/g, "");
+    const match = content.match(/SPORTZ-?([A-Z0-9]{8})/);
 
     if (!match) {
       console.log("⚠️ No SPORTZ code found in content:", content);
@@ -52,6 +54,7 @@ app.post("/webhook/sepay", async (req, res) => {
     }
 
     const shortCode = match[1];
+    // Luôn normalize về dạng có dash vì Flutter lưu Firestore là SPORTZ-XXXXXXXX
     const paymentReference = `SPORTZ-${shortCode}`;
 
     console.log(`🔍 Found payment reference: ${paymentReference}`);
